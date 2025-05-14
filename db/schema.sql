@@ -1,0 +1,13 @@
+CREATE TABLE domains (
+  id SERIAL PRIMARY KEY,
+  url VARCHAR(255) UNIQUE NOT NULL,
+  crawled_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE product_urls (
+  id BIGSERIAL PRIMARY KEY,
+  url TEXT UNIQUE NOT NULL,
+  domain_id INT REFERENCES domains(id) ON DELETE CASCADE,
+  discovered_at TIMESTAMPTZ DEFAULT NOW(),
+  crawled BOOLEAN DEFAULT false
+);

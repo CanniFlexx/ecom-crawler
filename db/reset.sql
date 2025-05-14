@@ -1,0 +1,1 @@
+TRUNCATE TABLE product_urls, domains RESTART IDENTITY CASCADE;
