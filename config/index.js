@@ -1,9 +1,7 @@
 const config = {
   targetDomains: [
-    'https://www.virgio.com/',
-    'https://www.tatacliq.com/',
-    'https://nykaafashion.com/',
-    'https://www.westside.com/'
+    'https://www.snitch.com/',
+    'https://www.virgio.com/'
   ],
   productPatterns: [/\/(product|item|p)\//i],
   concurrency: 5,

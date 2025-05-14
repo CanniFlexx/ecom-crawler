@@ -1,13 +1,16 @@
-//Improvised code logic that inserts the product URLs into th db at once when a webssite is completely crawled
-
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import PQueue from 'p-queue';
 import pool from '../db/index.js';
 import config from '../config/index.js';
-import { isProductPageOptimized, launchBrowser, closeBrowser } from './playwright-config.js';
+import { isProductPageOptimized, launchBrowser, closeBrowser, checkMultipleUrls } from './playwright-config.js';
 
-const playwrightQueue = new PQueue({ concurrency: 2 }); // Throttle Playwright concurrency
+// Create separate queues with different concurrency levels for different tasks
+const playwrightQueue = new PQueue({ concurrency: 5 }); // Increased from 2 to 5
+const httpQueue = new PQueue({ concurrency: 10 }); // New queue for HTTP requests
+
+// Cache for known product URL patterns to avoid redundant checks
+const patternMatchCache = new Map();
 
 /**
  * Checks if a URL is within the target domain or its subdomains.
@@ -15,10 +18,6 @@ const playwrightQueue = new PQueue({ concurrency: 2 }); // Throttle Playwright c
  * @param {string} targetDomain - The base URL or domain to match.
  * @returns {boolean}
  */
-
-//Fuction to check if a URL is within the target domain or its subdomains
-// For example, if the target domain is "snitch.com", it will return true for "www.snitch.com" and "subdomain.snitch.com"
-// This is useful for ensuring that we only crawl URLs that are relevant to the target domain and not external links like linkedin.com or google.com
 function isUrlInDomain(url, targetDomain) {
   try {
     const urlHostname = new URL(url).hostname.toLowerCase();
@@ -33,6 +32,103 @@ function isUrlInDomain(url, targetDomain) {
 }
 
 /**
+ * Pre-filters URLs that are likely to be product pages based on patterns
+ * @param {string} url - URL to check
+ * @returns {boolean} - True if URL matches product patterns
+ */
+function isLikelyProductByPattern(url) {
+  // Check cache first
+  if (patternMatchCache.has(url)) {
+    return patternMatchCache.get(url);
+  }
+  
+  // Common product URL patterns
+  const result = config.productPatterns.some(p => p.test(url)) || 
+                 /\/p\/|\/product\/|\/item\/|\/pd\/|[?&](pid|product_id|productid|itemid|sku)=/i.test(url);
+  
+  // Cache the result
+  patternMatchCache.set(url, result);
+  return result;
+}
+
+/**
+ * Extracts all links from HTML content
+ * @param {string} html - HTML content
+ * @param {string} baseUrl - Base URL for resolving relative links
+ * @returns {string[]} - Array of normalized URLs
+ */
+function extractLinks(html, baseUrl) {
+  const $ = cheerio.load(html);
+  const links = new Set();
+  
+  $('a[href]').each((_, el) => {
+    try {
+      const href = new URL($(el).attr('href'), baseUrl).href;
+      const protocol = new URL(href).protocol;
+      if (protocol === 'http:' || protocol === 'https:') {
+        links.add(href);
+      }
+    } catch (_) {
+      // Invalid URL, skip
+    }
+  });
+  
+  return Array.from(links);
+}
+
+/**
+ * Process URLs in batches for both crawling and product detection
+ * @param {string[]} urls - URLs to fetch
+ * @param {string} baseUrl - Base domain URL
+ * @param {Set} visited - Set of already visited URLs
+ * @returns {Promise<{crawlUrls: string[], productUrls: string[]}>}
+ */
+async function processBatch(urls, baseUrl, visited) {
+  // Filter URLs to only process those in domain and not yet visited
+  const filteredUrls = urls.filter(url => 
+    isUrlInDomain(url, baseUrl) && !visited.has(url)
+  );
+  
+  if (filteredUrls.length === 0) return { crawlUrls: [], productUrls: [] };
+  
+  // First pass: identify likely product pages by URL pattern
+  const likelyProductUrls = [];
+  const needCheckUrls = [];
+  
+  for (const url of filteredUrls) {
+    if (isLikelyProductByPattern(url)) {
+      likelyProductUrls.push(url);
+    } else {
+      needCheckUrls.push(url);
+    }
+  }
+  
+  // Second pass: use Playwright to check uncertain URLs in parallel
+  let confirmedProductUrls = [];
+  if (needCheckUrls.length > 0) {
+    const browser = await launchBrowser();
+    const results = await playwrightQueue.add(() => 
+      checkMultipleUrls(needCheckUrls, 5) // Using our batch processing function
+    );
+    
+    // Convert results object to array of confirmed product URLs
+    confirmedProductUrls = Object.entries(results)
+      .filter(([_, isProduct]) => isProduct)
+      .map(([url]) => url);
+  }
+  
+  // Combine all product URLs
+  const allProductUrls = [...likelyProductUrls, ...confirmedProductUrls];
+  
+  // URLs to crawl are those that aren't products
+  const crawlUrls = filteredUrls.filter(url => 
+    !allProductUrls.includes(url)
+  );
+  
+  return { crawlUrls, productUrls: allProductUrls };
+}
+
+/**
  * Crawl a domain starting from baseUrl.
  * @param {string} baseUrl - The root URL to start crawling from.
  * @param {(url: string) => void} onCrawlUrl - Optional callback invoked with each URL crawled.
@@ -41,7 +137,9 @@ function isUrlInDomain(url, targetDomain) {
 async function crawlDomain(baseUrl, onCrawlUrl = () => {}) {
   const visited = new Set();
   const productUrls = new Set();
-  const queue = [{ url: baseUrl, depth: 0 }];
+  const pagesToCrawl = new Set([baseUrl]);
+  
+  console.time('Total crawl time');
 
   // Registering domains at the "domains" table of the database
   const { rows: [domain] } = await pool.query(
@@ -51,81 +149,109 @@ async function crawlDomain(baseUrl, onCrawlUrl = () => {}) {
     [baseUrl]
   );
 
-  const browser = await launchBrowser();
-
-  while (queue.length > 0) {
-    const { url, depth } = queue.shift();
-
-    if (depth > config.maxDepth || visited.has(url)) continue;
-
-    visited.add(url); // Mark visited to avoid duplicates
-
-    // Invoke progress callback
-    onCrawlUrl(url);
-
-    try {
-      const { data } = await axios.get(url, {
-        timeout: 10000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MyCrawler/1.0)' }
-      });
-      const $ = cheerio.load(data);
-      const rawLinks = [];
-
-      $('a[href]').each((_, el) => {
-        try {
-          const href = new URL($(el).attr('href'), baseUrl).href;
-          const protocol = new URL(href).protocol;
-          if ((protocol === 'http:' || protocol === 'https:') && !visited.has(href)) {
-            rawLinks.push(href);
-          }
-        } catch (_) {
-        }
-      });
-
-      for (const href of rawLinks) {
-        // Only process URLs within the target domain
-        if (!isUrlInDomain(href, baseUrl)) continue;
-        if (productUrls.has(href) || visited.has(href)) continue;
-
-        if (config.productPatterns.some(p => p.test(href))) {
-          productUrls.add(href);
-          visited.add(href);
-        } else {
-          try {
-            const isLikelyProduct = await playwrightQueue.add(() =>
-              isProductPageOptimized(href, browser)
-            );
-            if (isLikelyProduct) {
-              productUrls.add(href);
-              visited.add(href);
-            } else {
-              queue.push({ url: href, depth: depth + 1 });
-            }
-          } catch (err) {
-            console.error(`Playwright check failed for ${href}: ${err.message}`);
-          }
-        }
+  // Initialize browser once for the entire crawl
+  await launchBrowser();
+  
+  // Batch processing
+  const batchSize = 20; // Process 20 URLs at a time
+  
+  try {
+    while (pagesToCrawl.size > 0) {
+      // Get a batch of URLs to process
+      const currentBatch = Array.from(pagesToCrawl).slice(0, batchSize);
+      
+      // Remove these from the set
+      currentBatch.forEach(url => pagesToCrawl.delete(url));
+      
+      // Mark as visited
+      currentBatch.forEach(url => visited.add(url));
+      
+      // Fetch pages in parallel
+      const pagePromises = currentBatch.map(url => 
+        httpQueue.add(() => 
+          axios.get(url, {
+            timeout: 8000, // Reduced timeout
+            headers: { 
+              'User-Agent': 'Mozilla/5.0 (compatible; MyCrawler/1.0)',
+              // Only request HTML, no images or other assets
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+              'Accept-Language': 'en-US,en;q=0.9',
+            },
+            // Abort the request if it takes too long to start receiving data
+            maxContentLength: 1024 * 1024, // 1MB max size
+          })
+          .then(response => {
+            onCrawlUrl(url); // Report progress
+            return { url, data: response.data, success: true };
+          })
+          .catch(error => {
+            console.error(`Failed to fetch ${url}: ${error.message}`);
+            return { url, data: null, success: false };
+          })
+        )
+      );
+      
+      const responses = await Promise.all(pagePromises);
+      
+      // Extract all links from successful responses
+      const allExtractedLinks = [];
+      for (const response of responses.filter(r => r.success)) {
+        const links = extractLinks(response.data, response.url);
+        allExtractedLinks.push(...links);
       }
-
-    } catch (error) {
-      console.error(`Failed to crawl ${url}: ${error.message}`);
+      
+      // Process links to identify products and new URLs to crawl
+      const { crawlUrls, productUrls: newProductUrls } = await processBatch(
+        allExtractedLinks, 
+        baseUrl, 
+        visited
+      );
+      
+      // Add new product URLs to our set
+      newProductUrls.forEach(url => productUrls.add(url));
+      
+      // Add new URLs to crawl, but only if we haven't exceeded max depth
+      if (visited.size <= config.maxDepth * 100) { // Rough estimate of max pages
+        crawlUrls.forEach(url => pagesToCrawl.add(url));
+      }
+      
+      // Batch insert discovered product URLs periodically
+      if (productUrls.size > 0 && productUrls.size % 50 === 0) {
+        await batchInsertProductUrls(Array.from(productUrls), domain.id);
+        console.log(`Inserted ${productUrls.size} product URLs so far`);
+      }
     }
+    
+    // Final insert of any remaining product URLs
+    if (productUrls.size > 0) {
+      await batchInsertProductUrls(Array.from(productUrls), domain.id);
+    }
+    
+  } finally {
+    await closeBrowser();
+    console.timeEnd('Total crawl time');
   }
 
-  // Insert all product URLs at once after crawling
-  if (productUrls.size > 0) {
-    const urlsArray = Array.from(productUrls);
+  return Array.from(productUrls);
+}
+
+/**
+ * Insert product URLs in batches to avoid large queries
+ * @param {string[]} urls - URLs to insert
+ * @param {number} domainId - Domain ID  
+ */
+async function batchInsertProductUrls(urls, domainId) {
+  try {
+    // Using unnest() for efficient bulk insert
     await pool.query(
       `INSERT INTO product_urls (url, domain_id)
        SELECT unnest($1::text[]), $2
        ON CONFLICT (url) DO NOTHING`,
-      [urlsArray, domain.id]
+      [urls, domainId]
     );
+  } catch (error) {
+    console.error(`Failed to insert product URLs: ${error.message}`);
   }
-
-  await closeBrowser();
-
-  return Array.from(productUrls);
 }
 
 export { crawlDomain };
